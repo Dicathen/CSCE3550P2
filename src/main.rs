@@ -1,12 +1,14 @@
 use chrono::Utc;
 use jsonwebtoken::{encode as jwt_encode, Algorithm, EncodingKey, Header};
-use rsa::pkcs1::LineEnding;
+use rsa::pkcs1::{LineEnding, DecodeRsaPrivateKey};
 use rsa::{pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts, RsaPrivateKey, RsaPublicKey};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use warp::Filter;
+use rusqlite::{params, Connection, Result};
 
 #[tokio::main]
 async fn main() {
@@ -14,6 +16,40 @@ async fn main() {
     let private_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
     let public_key = RsaPublicKey::from(&private_key);
     const KID: &str = "goodKID";
+
+    let conn = Connection::open("totally_not_my_privateKeys.db").unwrap();
+
+    conn.execute("
+    CREATE TABLE IF NOT EXISTS keys(
+        kid INTEGER PRIMARY KEY AUTOINCREMENT,
+        key BLOB NOT NULL,
+        exp INTEGER NOT NULL
+    )
+    ", []).unwrap();
+
+    let unexpired_private_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let unexpired_public_key = RsaPublicKey::from(&unexpired_private_key);
+    const unexpired_KID: &str = "goodKID";
+    let unexpired_expiry  = Utc::now() + Duration::from_secs(3600);
+    let unexpired_private_key_pem = unexpired_private_key.to_pkcs1_pem(LineEnding::LF).unwrap();
+
+    let expired_private_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let expired_public_key = RsaPublicKey::from(&expired_private_key);
+    const expired_KID: &str = "expiredKID";
+    let expired_expiry  = Utc::now() - Duration::from_secs(3600);
+    let expired_private_key_pem = expired_private_key.to_pkcs1_pem(LineEnding::LF).unwrap();
+
+    conn.execute(" INSERT INTO keys (key, exp) VALUES (?, ?) ", 
+        params![&unexpired_private_key_pem.as_bytes(), unexpired_expiry.timestamp()]
+    ).unwrap();
+    conn.execute(" INSERT INTO keys (key, exp) VALUES (?, ?) ", 
+        params![&expired_private_key_pem.as_bytes(), expired_expiry.timestamp()]
+    ).unwrap();
+
+    conn.close().unwrap();
+    
+
+
 
     // Convert private key to PEM format
     let private_key_pem = private_key.to_pkcs1_pem(LineEnding::LF).unwrap();
@@ -31,6 +67,7 @@ async fn main() {
         warp::post()
             .and(warp::query::<HashMap<String, String>>()) // Extract query parameters
             .map(move |params: HashMap<String, String>| {
+            
                 let mut claims = BTreeMap::new();
                 claims.insert("sub", "1234567890");
                 claims.insert("name", "John Doe");
@@ -50,7 +87,7 @@ async fn main() {
                 }
                 let exp_string = expiration.timestamp().to_string();
                 claims.insert("exp", &exp_string);
-
+                
                 let token = jwt_encode(&header, &claims, &encoding_key).unwrap();
                 warp::reply::with_status(token, warp::http::StatusCode::OK)
             })
@@ -62,7 +99,7 @@ async fn main() {
             .map(move || {
                 let n = base64_url::encode(&get_modulus(&public_key));
                 let e = base64_url::encode(&get_exponent(&public_key));
-
+        
                 let jwk = json!({
                     "kty": "RSA",
                     "kid": KID,
